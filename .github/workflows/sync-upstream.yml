@@ -1,0 +1,110 @@
+# Periodically merges changes from the upstream laravel/ai repository into this
+# fork via a pull request, so updates can be reviewed before they land.
+#
+# Authentication:
+#   Uses the organization secret GH_CI_COMMIT_TOKEN. Ensure its repository
+#   access policy includes this repo (Org > Settings > Secrets and variables >
+#   Actions > GH_CI_COMMIT_TOKEN), and that the token grants `repo` + `workflow`.
+#
+#   A user/PAT token is used instead of the built-in GITHUB_TOKEN because the org
+#   has the "Allow GitHub Actions to create and approve pull requests" policy
+#   disabled, which blocks the GITHUB_TOKEN from opening PRs. Using this token
+#   also means CI workflows (tests.yml, etc.) run on the sync PR, which they
+#   would not if it were opened by the GITHUB_TOKEN.
+
+name: sync upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch: # allow manual runs from the Actions tab
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream changes
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      UPSTREAM_REPO: https://github.com/laravel/ai.git
+      BRANCH: 0.x
+      SYNC_BRANCH: automated/upstream-sync
+      GH_TOKEN: ${{ secrets.GH_CI_COMMIT_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.GH_CI_COMMIT_TOKEN }}
+
+      - name: Merge upstream and open pull request
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --quiet upstream "$BRANCH"
+          git fetch --quiet origin "$BRANCH"
+
+          # How many upstream commits are not yet in our branch?
+          AHEAD=$(git rev-list --count "origin/$BRANCH..upstream/$BRANCH")
+          echo "Upstream is $AHEAD commit(s) ahead of origin/$BRANCH."
+
+          if [ "$AHEAD" -eq 0 ]; then
+            echo "Already up to date with upstream. Nothing to do."
+            exit 0
+          fi
+
+          # Capture the incoming commit list for the PR body before merging.
+          COMMITS=$(git log --no-merges --pretty=format:'- %h %s (%an)' "origin/$BRANCH..upstream/$BRANCH")
+
+          # Rebuild the sync branch from our current branch tip each run.
+          git checkout -B "$SYNC_BRANCH" "origin/$BRANCH"
+
+          if git merge --no-edit "upstream/$BRANCH"; then
+            STATUS="clean"
+            CONFLICTS=""
+            echo "Merged upstream/$BRANCH cleanly."
+          else
+            STATUS="conflicts"
+            CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+            git merge --abort
+            # Point the branch at the upstream tip so the PR still surfaces the
+            # changes; the conflicts must be resolved when merging the PR.
+            git reset --hard "upstream/$BRANCH"
+            echo "Merge produced conflicts; PR will require manual resolution."
+          fi
+
+          git push --force origin "$SYNC_BRANCH"
+
+          if [ "$STATUS" = "clean" ]; then
+            TITLE="Merge upstream laravel/ai ($BRANCH) — $AHEAD commit(s)"
+            CONFLICT_SECTION="✅ Merged cleanly. Review and merge when ready."
+          else
+            TITLE="⚠️ Merge upstream laravel/ai ($BRANCH) — manual resolution required"
+            CONFLICT_SECTION=$(printf '⚠️ This merge has conflicts that must be resolved before merging. Conflicting files:\n\n```\n%s\n```' "$CONFLICTS")
+          fi
+
+          BODY=$(printf 'Automated sync of [\`laravel/ai\`](https://github.com/laravel/ai) `%s` into `%s`.\n\n%s\n\n### Incoming commits (%s)\n\n%s\n\n---\n_Opened by the `sync upstream` workflow._' \
+            "$BRANCH" "$BRANCH" "$CONFLICT_SECTION" "$AHEAD" "$COMMITS")
+
+          EXISTING=$(gh pr list --head "$SYNC_BRANCH" --base "$BRANCH" --state open --json number --jq '.[0].number // empty')
+
+          if [ -n "$EXISTING" ]; then
+            gh pr edit "$EXISTING" --title "$TITLE" --body "$BODY"
+            echo "Updated existing PR #$EXISTING."
+          else
+            gh pr create --base "$BRANCH" --head "$SYNC_BRANCH" --title "$TITLE" --body "$BODY"
+            echo "Opened a new pull request."
+          fi
