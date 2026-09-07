@@ -7,8 +7,6 @@ use Laravel\Ai\Exceptions\AiException;
 use Laravel\Ai\Stores;
 
 beforeEach(function (): void {
-    Sleep::fake(false);
-
     config(['ai.providers.gemini' => [
         ...config('ai.providers.gemini'),
         'key' => 'test-gemini-key',
@@ -165,7 +163,7 @@ test('add file reports an import operation error', function (): void {
     $provider = geminiProvider();
 
     expect(fn (): string => $provider->storeGateway()->addFile($provider, 'store123', 'file789'))
-        ->toThrow(AiException::class, 'Gemini file import failed: [13] Indexing failed.');
+        ->toThrow(AiException::class, 'Gemini Error: [13] Indexing failed.');
 });
 
 test('add file rejects a completed import without a document name', function (): void {
@@ -180,7 +178,25 @@ test('add file rejects a completed import without a document name', function ():
     $provider = geminiProvider();
 
     expect(fn (): string => $provider->storeGateway()->addFile($provider, 'store123', 'file789'))
-        ->toThrow(AiException::class, 'Gemini file import completed without a document name.');
+        ->toThrow(AiException::class, 'Gemini Error: [invalid_response] File import completed without a document name.');
+});
+
+test('add file times out when the import operation never completes', function (): void {
+    Sleep::fake();
+
+    Http::fake([
+        'generativelanguage.googleapis.com/*' => Http::response([
+            'name' => 'fileSearchStores/store123/operations/import456',
+            'done' => false,
+        ]),
+    ]);
+
+    $provider = geminiProvider();
+
+    expect(fn (): string => $provider->storeGateway()->addFile($provider, 'store123', 'file789'))
+        ->toThrow(AiException::class, 'Gemini Error: [timeout] File import operation did not complete.');
+
+    Http::assertSentCount(61);
 });
 
 test('add file with metadata formats correctly', function (): void {

@@ -21,10 +21,6 @@ class GeminiStoreGateway implements StoreGateway
     use CreatesClient;
     use HandlesFailoverErrors;
 
-    protected const IMPORT_OPERATION_MAX_ATTEMPTS = 60;
-
-    protected const IMPORT_OPERATION_POLL_INTERVAL_SECONDS = 5;
-
     /**
      * Get a vector store by its ID.
      */
@@ -94,7 +90,7 @@ class GeminiStoreGateway implements StoreGateway
 
         if ($operation->json('error') !== null) {
             throw new AiException(sprintf(
-                'Gemini file import failed: [%s] %s',
+                'Gemini Error: [%s] %s',
                 $operation->json('error.code', 'unknown'),
                 $operation->json('error.message', 'Unknown Gemini error.'),
             ));
@@ -103,7 +99,7 @@ class GeminiStoreGateway implements StoreGateway
         $documentName = $operation->json('response.documentName');
 
         if (! is_string($documentName) || $documentName === '') {
-            throw new AiException('Gemini file import completed without a document name.');
+            throw new AiException('Gemini Error: [invalid_response] File import completed without a document name.');
         }
 
         return basename($documentName);
@@ -116,19 +112,12 @@ class GeminiStoreGateway implements StoreGateway
     {
         $operationName = $operation->json('name');
 
-        if (! is_string($operationName) || $operationName === '') {
-            throw new AiException('Gemini file import did not return an operation name.');
-        }
-
-        $attempts = 0;
-
-        while (! $operation->json('done', false)) {
-            if ($attempts >= self::IMPORT_OPERATION_MAX_ATTEMPTS) {
-                throw new AiException('Gemini file import operation timed out.');
+        for ($attempt = 0; ! $operation->json('done', false); $attempt++) {
+            if ($attempt >= 60) {
+                throw new AiException('Gemini Error: [timeout] File import operation did not complete.');
             }
 
-            $attempts++;
-            Sleep::for(self::IMPORT_OPERATION_POLL_INTERVAL_SECONDS)->seconds();
+            Sleep::for(5)->seconds();
 
             $operation = $this->withErrorHandling(
                 $provider->name(),
