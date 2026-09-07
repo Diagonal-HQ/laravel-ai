@@ -14,7 +14,6 @@ use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\ImageProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
-use Laravel\Ai\Files\File;
 use Laravel\Ai\Files\Image;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Gateway\Concerns\ParsesServerSentEvents;
@@ -124,16 +123,10 @@ class OpenAiGateway implements Gateway, StepTextGateway
         $field = $isGptImage ? 'image[]' : 'image';
 
         foreach ($attachments as $attachment) {
-            if (! $attachment instanceof File && ! $attachment instanceof UploadedFile) {
-                throw new InvalidArgumentException(
-                    'Unsupported attachment type ['.$attachment::class.']'
-                );
-            }
-
             $content = match (true) {
-                $attachment instanceof StorableFile => $attachment->content(),
+                $attachment instanceof Image && $attachment instanceof StorableFile => $attachment->content(),
                 $attachment instanceof UploadedFile => $attachment->get(),
-                default => throw new InvalidArgumentException('Unsupported image attachment type ['.$attachment::class.']'),
+                default => throw new InvalidArgumentException('Unsupported image attachment type ['.get_debug_type($attachment).']'),
             };
 
             $request = $request->attach($field, $content, 'image.png');
