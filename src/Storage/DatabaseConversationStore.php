@@ -13,6 +13,7 @@ use Laravel\Ai\Approvals\PendingApproval;
 use Laravel\Ai\Contracts\ConversationStore;
 use Laravel\Ai\Contracts\PaginatesConversations;
 use Laravel\Ai\Contracts\ResolvesPendingApprovals;
+use Laravel\Ai\Contracts\VerifiesConversationOwnership;
 use Laravel\Ai\Exceptions\ApprovalMismatchException;
 use Laravel\Ai\Files\File;
 use Laravel\Ai\Messages\AssistantMessage;
@@ -24,7 +25,7 @@ use Laravel\Ai\Responses\AgentResponse;
 use Laravel\Ai\Responses\Data\ToolCall;
 use Laravel\Ai\Responses\Data\ToolResult;
 
-class DatabaseConversationStore implements ConversationStore, PaginatesConversations, ResolvesPendingApprovals
+class DatabaseConversationStore implements ConversationStore, PaginatesConversations, ResolvesPendingApprovals, VerifiesConversationOwnership
 {
     /**
      * Create a new conversation store instance.
@@ -44,6 +45,20 @@ class DatabaseConversationStore implements ConversationStore, PaginatesConversat
             ->where('participant_id', $participantId)
             ->orderBy('updated_at', 'desc')
             ->first()?->id;
+    }
+
+    /**
+     * Determine whether the given conversation was stored for the given participant.
+     */
+    public function conversationBelongsTo(string $conversationId, ?string $participantType, string|int|null $participantId): bool
+    {
+        $conversation = $this->table($this->conversationsTable())
+            ->where('id', $conversationId)
+            ->first(['participant_type', 'participant_id']);
+
+        return $conversation !== null
+            && $conversation->participant_type === $participantType
+            && (string) $conversation->participant_id === (string) $participantId;
     }
 
     /**
