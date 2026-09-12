@@ -4,7 +4,7 @@ namespace Laravel\Ai\Providers;
 
 use Illuminate\Contracts\Events\Dispatcher;
 use Laravel\Ai\Contracts\Gateway\EmbeddingGateway;
-use Laravel\Ai\Contracts\Gateway\TextGateway;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Gateway\Ollama\OllamaGateway;
@@ -27,6 +27,7 @@ class OllamaProvider extends Provider implements EmbeddingProvider, TextProvider
     /**
      * Get the credentials for the Ollama provider (API key is optional).
      */
+    #[\Override]
     public function providerCredentials(): array
     {
         return [
@@ -45,7 +46,7 @@ class OllamaProvider extends Provider implements EmbeddingProvider, TextProvider
     /**
      * Get the provider's text gateway.
      */
-    public function textGateway(): TextGateway
+    public function textGateway(): StepTextGateway
     {
         return $this->textGateway ??= $this->ollamaGateway();
     }
@@ -63,7 +64,7 @@ class OllamaProvider extends Provider implements EmbeddingProvider, TextProvider
      */
     public function defaultTextModel(): string
     {
-        return $this->config['models']['text']['default'] ?? 'llama3.1:8b';
+        return $this->config['models']['text']['default'] ?? 'qwen3.5:4b';
     }
 
     /**
@@ -71,7 +72,7 @@ class OllamaProvider extends Provider implements EmbeddingProvider, TextProvider
      */
     public function cheapestTextModel(): string
     {
-        return $this->config['models']['text']['cheapest'] ?? 'llama3.1:8b';
+        return $this->config['models']['text']['cheapest'] ?? 'qwen3.5:0.8b';
     }
 
     /**
@@ -79,7 +80,7 @@ class OllamaProvider extends Provider implements EmbeddingProvider, TextProvider
      */
     public function smartestTextModel(): string
     {
-        return $this->config['models']['text']['smartest'] ?? 'llama3.1:70b';
+        return $this->config['models']['text']['smartest'] ?? 'qwen3.5:cloud';
     }
 
     /**

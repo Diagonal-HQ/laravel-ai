@@ -2,147 +2,99 @@
 
 namespace Laravel\Ai\Gateway\OpenRouter;
 
-use Generator;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Collection;
 use InvalidArgumentException;
 use Laravel\Ai\Contracts\Files\TranscribableAudio;
 use Laravel\Ai\Contracts\Gateway\Gateway;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\ImageProvider;
-use Laravel\Ai\Contracts\Providers\TextProvider;
+use Laravel\Ai\Contracts\Providers\SupportsWebFetch;
+use Laravel\Ai\Contracts\Providers\SupportsWebSearch;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
 use Laravel\Ai\Files\Image;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
-use Laravel\Ai\Gateway\Concerns\InvokesTools;
 use Laravel\Ai\Gateway\Concerns\ParsesServerSentEvents;
 use Laravel\Ai\Gateway\Concerns\WrapsPcmAudio;
-use Laravel\Ai\Gateway\TextGenerationOptions;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\MapsChatCompletionMessages;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\MapsChatCompletionTools;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\PerformsChatCompletionSteps;
+use Laravel\Ai\Providers\Provider;
+use Laravel\Ai\Providers\Tools\ProviderTool;
+use Laravel\Ai\Providers\Tools\WebFetch;
+use Laravel\Ai\Providers\Tools\WebSearch;
 use Laravel\Ai\Responses\AudioResponse;
 use Laravel\Ai\Responses\Data\GeneratedImage;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\EmbeddingsResponse;
 use Laravel\Ai\Responses\ImageResponse;
-use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Responses\TranscriptionResponse;
 use LogicException;
+use RuntimeException;
 
-class OpenRouterGateway implements Gateway
+class OpenRouterGateway implements Gateway, StepTextGateway
 {
     use Concerns\BuildsTextRequests;
     use Concerns\CreatesOpenRouterClient;
     use Concerns\HandlesTextStreaming;
     use Concerns\MapsAttachments;
-    use Concerns\MapsMessages;
-    use Concerns\MapsTools;
     use Concerns\ParsesTextResponses;
     use HandlesFailoverErrors;
-    use InvokesTools;
+    use MapsChatCompletionMessages;
+    use MapsChatCompletionTools;
     use ParsesServerSentEvents;
+    use PerformsChatCompletionSteps;
     use WrapsPcmAudio;
 
     public function __construct(protected Dispatcher $events)
     {
-        $this->initializeToolCallbacks();
+        //
     }
 
     /**
-     * {@inheritdoc}
+     * Map a provider tool to an OpenRouter tool definition.
      */
-    public function generateText(
-        TextProvider $provider,
-        string $model,
-        ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
-    ): TextResponse {
-        $body = $this->buildTextRequestBody(
-            $provider,
-            $model,
-            $instructions,
-            $messages,
-            $tools,
-            $schema,
-            $options,
-        );
-
-        $response = $this->withErrorHandling(
-            $provider->name(),
-            fn () => $this->client($provider, $timeout)->post('chat/completions', $body),
-        );
-
-        $data = $response->json();
-
-        $this->validateTextResponse($data);
-
-        return $this->parseTextResponse(
-            $data,
-            $provider,
-            filled($schema),
-            $tools,
-            $schema,
-            $options,
-            $instructions,
-            $messages,
-            $timeout,
-        );
+    protected function mapProviderTool(ProviderTool $tool, Provider $provider): array
+    {
+        return match (true) {
+            $tool instanceof WebFetch => $this->mapWebFetchTool($tool, $provider),
+            $tool instanceof WebSearch => $this->mapWebSearchTool($tool, $provider),
+            default => throw new RuntimeException('OpenRouter does not support ['.class_basename($tool).'] provider tools.'),
+        };
     }
 
     /**
-     * {@inheritdoc}
+     * Map a web fetch tool to an OpenRouter server tool definition.
      */
-    public function streamText(
-        string $invocationId,
-        TextProvider $provider,
-        string $model,
-        ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
-    ): Generator {
-        $body = $this->buildTextRequestBody(
-            $provider,
-            $model,
-            $instructions,
-            $messages,
-            $tools,
-            $schema,
-            $options,
-        );
+    protected function mapWebFetchTool(WebFetch $tool, Provider $provider): array
+    {
+        if (! $provider instanceof SupportsWebFetch) {
+            throw new RuntimeException('Provider ['.$provider->name().'] does not support web fetch.');
+        }
 
-        $body['stream'] = true;
-        $body['stream_options'] = ['include_usage' => true];
+        return [
+            'type' => 'openrouter:web_fetch',
+            ...$provider->webFetchToolOptions($tool),
+        ];
+    }
 
-        $response = $this->withErrorHandling(
-            $provider->name(),
-            fn () => $this->client($provider, $timeout)
-                ->withOptions(['stream' => true])
-                ->post('chat/completions', $body),
-        );
+    /**
+     * Map a web search tool to an OpenRouter server tool definition.
+     */
+    protected function mapWebSearchTool(WebSearch $tool, Provider $provider): array
+    {
+        if (! $provider instanceof SupportsWebSearch) {
+            throw new RuntimeException('Provider ['.$provider->name().'] does not support web search.');
+        }
 
-        yield from $this->processTextStream(
-            $invocationId,
-            $provider,
-            $model,
-            $tools,
-            $schema,
-            $options,
-            $response->getBody(),
-            $instructions,
-            $messages,
-            0,
-            null,
-            [],
-            $timeout,
-        );
+        return [
+            'type' => 'openrouter:web_search',
+            ...$provider->webSearchToolOptions($tool),
+        ];
     }
 
     /**
@@ -179,7 +131,7 @@ class OpenRouterGateway implements Gateway
 
         $message = $data['choices'][0]['message'] ?? [];
 
-        $images = collect($message['images'] ?? [])->map(function (array $image) {
+        $images = collect($message['images'] ?? [])->map(function (array $image): ?GeneratedImage {
             $url = $image['image_url']['url'] ?? '';
 
             if (preg_match('/^data:(image\/[\w+.-]+);base64,(.+)$/', $url, $matches)) {
@@ -205,7 +157,7 @@ class OpenRouterGateway implements Gateway
      */
     protected function buildImageMessages(string $prompt, array $attachments): array
     {
-        if (empty($attachments)) {
+        if ($attachments === []) {
             return [['role' => 'user', 'content' => $prompt]];
         }
 

@@ -1,19 +1,21 @@
 <?php
 
+use Illuminate\Http\UploadedFile;
 use Illuminate\Support\Collection;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Files;
 use Laravel\Ai\Files\Document;
+use Laravel\Ai\Files\LocalDocument;
 use Laravel\Ai\Files\ProviderDocument;
 use Laravel\Ai\Stores;
 
 use function Illuminate\Support\days;
 
-describe('store operations', function () {
-    test('stores can be faked', function () {
+describe('store operations', function (): void {
+    test('stores can be faked', function (): void {
         Stores::fake([
             'first-store',
-            fn ($storeId) => "store-{$storeId}",
+            fn ($storeId): string => "store-{$storeId}",
             'Custom Store',
         ]);
 
@@ -27,7 +29,7 @@ describe('store operations', function () {
         expect($response)->id->toEqual('vs_3')->name->toEqual('Custom Store');
     });
 
-    test('stores can be faked with no predefined responses', function () {
+    test('stores can be faked with no predefined responses', function (): void {
         Stores::fake();
 
         $response = Stores::get('vs_1');
@@ -35,23 +37,23 @@ describe('store operations', function () {
         expect($response)->id->toEqual('vs_1')->name->toEqual('fake-store');
     });
 
-    test('stores can be faked with a closure', function () {
-        Stores::fake(fn ($storeId) => "name-for-{$storeId}");
+    test('stores can be faked with a closure', function (): void {
+        Stores::fake(fn ($storeId): string => "name-for-{$storeId}");
 
         $response = Stores::get('vs_1');
 
         expect($response)->id->toEqual('vs_1')->name->toEqual('name-for-vs_1');
     });
 
-    test('stores can prevent stray operations', function () {
+    test('stores can prevent stray operations', function (): void {
         Stores::fake()->preventStrayOperations();
 
         Stores::get('vs_1');
     })->throws(RuntimeException::class);
 });
 
-describe('store assertions', function () {
-    test('can assert store was created by name', function () {
+describe('store assertions', function (): void {
+    test('can assert store was created by name', function (): void {
         Stores::fake();
 
         Stores::create('My Vector Store');
@@ -60,7 +62,7 @@ describe('store assertions', function () {
         Stores::assertNotCreated('Other Store');
     });
 
-    test('can assert store was created with closure', function () {
+    test('can assert store was created with closure', function (): void {
         Stores::fake();
 
         Stores::create(
@@ -69,46 +71,46 @@ describe('store assertions', function () {
             expiresWhenIdleFor: days(7),
         );
 
-        Stores::assertCreated(fn (string $name) => $name === 'My Vector Store');
-        Stores::assertCreated(fn (string $name, ?string $description) => $description === 'A test store');
+        Stores::assertCreated(fn (string $name): bool => $name === 'My Vector Store');
+        Stores::assertCreated(fn (string $name, ?string $description): bool => $description === 'A test store');
 
         Stores::assertCreated(fn (
             string $name,
             ?string $description,
             Collection $fileIds,
             ?DateInterval $expiresWhenIdleFor
-        ) => $expiresWhenIdleFor !== null);
+        ): bool => $expiresWhenIdleFor instanceof DateInterval);
 
-        Stores::assertNotCreated(fn (string $name) => $name === 'Other Store');
+        Stores::assertNotCreated(fn (string $name): bool => $name === 'Other Store');
     });
 
-    test('can assert no stores were created', function () {
+    test('can assert no stores were created', function (): void {
         Stores::fake();
 
         Stores::assertNothingCreated();
     });
 
-    test('can assert store was deleted', function () {
+    test('can assert store was deleted', function (): void {
         Stores::fake();
 
         Stores::delete('vs_123');
 
         Stores::assertDeleted('vs_123');
-        Stores::assertDeleted(fn (string $id) => $id === 'vs_123');
+        Stores::assertDeleted(fn (string $id): bool => $id === 'vs_123');
 
         Stores::assertNotDeleted('vs_456');
-        Stores::assertNotDeleted(fn (string $id) => $id === 'vs_456');
+        Stores::assertNotDeleted(fn (string $id): bool => $id === 'vs_456');
     });
 
-    test('can assert no stores were deleted', function () {
+    test('can assert no stores were deleted', function (): void {
         Stores::fake();
 
         Stores::assertNothingDeleted();
     });
 });
 
-describe('file operations', function () {
-    test('can add file to store with provider id', function () {
+describe('file operations', function (): void {
+    test('can add file to store with provider id', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -119,7 +121,7 @@ describe('file operations', function () {
             ->and($searchable->fileId())->toEqual('file_123');
     });
 
-    test('can remove file from store with provider id', function () {
+    test('can remove file from store with provider id', function (): void {
         Stores::fake();
 
         $result = Stores::create('My Store')->remove(new ProviderDocument('file_123'));
@@ -127,7 +129,7 @@ describe('file operations', function () {
         expect($result)->toBeTrue();
     });
 
-    test('can remove file from store with string id', function () {
+    test('can remove file from store with string id', function (): void {
         Stores::fake();
 
         $result = Stores::create('My Store')->remove('file_123');
@@ -135,7 +137,7 @@ describe('file operations', function () {
         expect($result)->toBeTrue();
     });
 
-    test('can add storable file to store', function () {
+    test('can add storable file to store', function (): void {
         Stores::fake();
 
         $response = Stores::create('My Store')
@@ -144,13 +146,41 @@ describe('file operations', function () {
         expect($response)->not->toBeEmpty();
 
         Files::assertStored(
-            fn (StorableFile $file) => $file->content() === 'Hello, world!'
+            fn (StorableFile $file): bool => $file->content() === 'Hello, world!'
         );
     });
+
+    test('can add an uploaded file to store from its path', function (): void {
+        Stores::fake();
+
+        Stores::create('My Store')
+            ->add(new UploadedFile(__DIR__.'/../Fixtures/report.txt', 'report.txt', 'text/plain'));
+
+        Files::assertStored(fn (StorableFile $file): bool => $file instanceof LocalDocument);
+        Files::assertStored(fn (StorableFile $file): bool => $file->name() === 'report.txt');
+        Files::assertStored(fn (StorableFile $file): bool => $file->mimeType() === 'text/plain');
+        Files::assertStored(fn (StorableFile $file): bool => trim((string) $file) === 'I am an expense report.');
+    });
+
+    test('an added fake upload can still be read after the upload object is gone', function (): void {
+        Stores::fake();
+
+        Stores::create('My Store')
+            ->add(UploadedFile::fake()->createWithContent('report.txt', 'I am an expense report.'));
+
+        Files::assertStored(fn (StorableFile $file): bool => trim((string) $file) === 'I am an expense report.');
+    });
+
+    test('cannot add an uploaded file that failed to upload to store', function (): void {
+        Stores::fake();
+
+        Stores::create('My Store')
+            ->add(new UploadedFile('', 'report.txt', 'text/plain', UPLOAD_ERR_NO_TMP_DIR));
+    })->throws(InvalidArgumentException::class);
 });
 
-describe('file assertions', function () {
-    test('can assert file added to store', function () {
+describe('file assertions', function (): void {
+    test('can assert file added to store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -159,7 +189,7 @@ describe('file assertions', function () {
         $store->add($file);
 
         // Using closure receives the original file...
-        $store->assertAdded(fn ($f) => $f instanceof ProviderDocument && $f->id() === $file->id());
+        $store->assertAdded(fn ($f): bool => $f instanceof ProviderDocument && $f->id() === $file->id());
 
         // Using exact IDs...
         $store->assertAdded($file->id());
@@ -168,7 +198,7 @@ describe('file assertions', function () {
         $store->assertAdded('test.txt');
     });
 
-    test('can assert file added to store with storable file', function () {
+    test('can assert file added to store with storable file', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -176,11 +206,11 @@ describe('file assertions', function () {
         $store->add(Document::fromString('Hello, world!', 'text/plain')->as('hello.txt'));
 
         // Using closure receives the original StorableFile...
-        $store->assertAdded(fn (StorableFile $file) => $file->name() === 'hello.txt');
-        $store->assertAdded(fn (StorableFile $file) => $file->content() === 'Hello, world!');
+        $store->assertAdded(fn (StorableFile $file): bool => $file->name() === 'hello.txt');
+        $store->assertAdded(fn (StorableFile $file): bool => $file->content() === 'Hello, world!');
     });
 
-    test('can assert file not added to store', function () {
+    test('can assert file not added to store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -188,10 +218,10 @@ describe('file assertions', function () {
 
         $store->add($file);
 
-        $store->assertNotAdded(fn ($f) => $f instanceof ProviderDocument && $f->id() === 'file_456');
+        $store->assertNotAdded(fn ($f): bool => $f instanceof ProviderDocument && $f->id() === 'file_456');
     });
 
-    test('can assert file removed from store', function () {
+    test('can assert file removed from store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
@@ -200,7 +230,7 @@ describe('file assertions', function () {
         $store->remove($fileId);
 
         // Using closure...
-        $store->assertRemoved(fn ($fId) => $fId === $fileId);
+        $store->assertRemoved(fn ($fId): bool => $fId === $fileId);
 
         // Using exact IDs...
         $store->assertRemoved($fileId);
@@ -209,13 +239,13 @@ describe('file assertions', function () {
         $store->assertRemoved('test.txt');
     });
 
-    test('can assert file not removed from store', function () {
+    test('can assert file not removed from store', function (): void {
         Stores::fake();
 
         $store = Stores::create('My Store');
 
         $store->remove('file_123');
 
-        $store->assertNotRemoved(fn ($fileId) => $fileId === 'file_456');
+        $store->assertNotRemoved(fn ($fileId): bool => $fileId === 'file_456');
     });
 });

@@ -2,10 +2,12 @@
 
 namespace Laravel\Ai\Gateway\Gemini;
 
-use Illuminate\Support\Facades\Http;
+use Illuminate\Http\Client\PendingRequest;
 use Laravel\Ai\Contracts\Files\StorableFile;
 use Laravel\Ai\Contracts\Gateway\FileGateway;
 use Laravel\Ai\Contracts\Providers\FileProvider;
+use Laravel\Ai\Enums\Lab;
+use Laravel\Ai\Gateway\Concerns\CreatesClient;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
 use Laravel\Ai\Gateway\Concerns\PreparesStorableFiles;
 use Laravel\Ai\Providers\Provider;
@@ -14,6 +16,7 @@ use Laravel\Ai\Responses\StoredFileResponse;
 
 class GeminiFileGateway implements FileGateway
 {
+    use CreatesClient;
     use HandlesFailoverErrors;
     use PreparesStorableFiles;
 
@@ -24,9 +27,10 @@ class GeminiFileGateway implements FileGateway
     {
         $fileId = str_starts_with($fileId, 'files/') ? $fileId : "files/{$fileId}";
 
-        $response = $this->withErrorHandling($provider->name(), fn () => Http::withHeaders(array_filter([
-            'x-goog-api-key' => $provider->providerCredentials()['key'],
-        ]))->get($this->baseUrl($provider)."/{$fileId}")->throw());
+        $response = $this->withErrorHandling(
+            $provider->name(),
+            fn () => $this->client($provider)->get($this->baseUrl($provider)."/{$fileId}")->throw(),
+        );
 
         return new FileResponse(
             id: $response->json('name'),
@@ -45,13 +49,13 @@ class GeminiFileGateway implements FileGateway
 
         $uploadUrl = str_replace('/v1beta', '/upload/v1beta', $this->baseUrl($provider));
 
-        $response = $this->withErrorHandling($provider->name(), fn () => Http::withHeaders(array_filter([
-            'x-goog-api-key' => $provider->providerCredentials()['key'],
-        ]))->attach(
+        $providerOptions = $this->resolveProviderOptions($file, Lab::Gemini);
+
+        $response = $this->withErrorHandling($provider->name(), fn () => $this->client($provider)->attach(
             'file', $content, $name, ['Content-Type' => $mime]
-        )->post("{$uploadUrl}/files", [
+        )->post("{$uploadUrl}/files", array_replace_recursive([
             'file' => ['display_name' => $name],
-        ])->throw());
+        ], $providerOptions))->throw());
 
         return new StoredFileResponse($response->json('file.name'));
     }
@@ -63,9 +67,21 @@ class GeminiFileGateway implements FileGateway
     {
         $fileId = str_starts_with($fileId, 'files/') ? $fileId : "files/{$fileId}";
 
-        $this->withErrorHandling($provider->name(), fn () => Http::withHeaders(array_filter([
-            'x-goog-api-key' => $provider->providerCredentials()['key'],
-        ]))->delete($this->baseUrl($provider)."/{$fileId}")->throw());
+        $this->withErrorHandling(
+            $provider->name(),
+            fn () => $this->client($provider)->delete($this->baseUrl($provider)."/{$fileId}")->throw(),
+        );
+    }
+
+    protected function client(Provider $provider): PendingRequest
+    {
+        return $this->createClient(
+            $this->baseUrl($provider),
+            array_filter(['x-goog-api-key' => $provider->providerCredentials()['key']]),
+            $provider->additionalConfiguration()['headers'] ?? [],
+            timeout: null,
+            throw: false,
+        );
     }
 
     /**
