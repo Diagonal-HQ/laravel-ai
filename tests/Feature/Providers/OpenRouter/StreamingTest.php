@@ -1,7 +1,9 @@
 <?php
 
 use Illuminate\Support\Facades\Http;
+use Laravel\Ai\Exceptions\StreamErrorException;
 use Laravel\Ai\Responses\Data\FinishReason;
+use Laravel\Ai\Streaming\Events\Citation as CitationEvent;
 use Laravel\Ai\Streaming\Events\Error;
 use Laravel\Ai\Streaming\Events\StreamEnd;
 use Laravel\Ai\Streaming\Events\StreamStart;
@@ -14,14 +16,14 @@ use Tests\Fixtures\Tools\FixedNumberGenerator;
 
 use function Laravel\Ai\agent;
 
-beforeEach(function () {
+beforeEach(function (): void {
     config(['ai.providers.openrouter' => [
         ...config('ai.providers.openrouter'),
         'key' => 'test-key',
     ]]);
 });
 
-test('streaming emits text events', function () {
+test('streaming emits text events', function (): void {
     Http::fake([
         '*' => Http::response($this->ssePayload([
             ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Hello'], 'finish_reason' => null]]],
@@ -43,12 +45,12 @@ test('streaming emits text events', function () {
         ->toContain(TextEnd::class)
         ->toContain(StreamEnd::class);
 
-    $textDeltas = array_values(array_filter($events, fn ($e) => $e instanceof TextDelta));
+    $textDeltas = array_values(array_filter($events, fn ($e): bool => $e instanceof TextDelta));
     expect($textDeltas[0]->delta)->toBe('Hello')
         ->and($textDeltas[1]->delta)->toBe(' world');
 });
 
-test('streaming handles tool calls', function () {
+test('streaming handles tool calls', function (): void {
     Http::fake([
         '*' => Http::sequence([
             Http::response($this->ssePayload([
@@ -68,15 +70,48 @@ test('streaming handles tool calls', function () {
         $events[] = $event;
     }
 
-    $toolCallEvents = array_values(array_filter($events, fn ($e) => $e instanceof ToolCallEvent));
-    $toolResultEvents = array_values(array_filter($events, fn ($e) => $e instanceof ToolResultEvent));
+    $toolCallEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof ToolCallEvent));
+    $toolResultEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof ToolResultEvent));
+    $streamEndEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd));
 
     expect($toolCallEvents)->toHaveCount(1)
         ->and($toolCallEvents[0]->toolCall->name)->toBe('FixedNumberGenerator')
-        ->and($toolResultEvents)->toHaveCount(1);
+        ->and($toolResultEvents)->toHaveCount(1)
+        ->and($streamEndEvents)->toHaveCount(1)
+        ->and($events[count($events) - 1])->toBeInstanceOf(StreamEnd::class)
+        ->and($streamEndEvents[0]->reason)->toBe(FinishReason::Stop->value);
 });
 
-test('streaming error event stops stream', function () {
+test('streaming tool loop emits a single stream end with accumulated usage', function (): void {
+    Http::fake([
+        '*' => Http::sequence([
+            Http::response($this->ssePayload([
+                ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'tool_calls' => [['index' => 0, 'id' => 'call_123', 'type' => 'function', 'function' => ['name' => 'FixedNumberGenerator', 'arguments' => '']]]], 'finish_reason' => null]]],
+                ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['tool_calls' => [['index' => 0, 'function' => ['arguments' => '{}']]]], 'finish_reason' => null]]],
+                ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'tool_calls']], 'usage' => ['prompt_tokens' => 10, 'completion_tokens' => 5]],
+            ])),
+            Http::response($this->ssePayload([
+                ['id' => 'chatcmpl-2', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'The number is 72019'], 'finish_reason' => null]]],
+                ['id' => 'chatcmpl-2', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'stop']], 'usage' => ['prompt_tokens' => 20, 'completion_tokens' => 10]],
+            ])),
+        ]),
+    ]);
+
+    $events = [];
+
+    foreach (agent(tools: [new FixedNumberGenerator])->stream('Give me a number', provider: 'openrouter') as $event) {
+        $events[] = $event;
+    }
+
+    $streamEndEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd));
+
+    expect($streamEndEvents)->toHaveCount(1)
+        ->and($streamEndEvents[0]->reason)->toBe(FinishReason::Stop->value)
+        ->and($streamEndEvents[0]->usage->promptTokens)->toBe(30)
+        ->and($streamEndEvents[0]->usage->completionTokens)->toBe(15);
+});
+
+test('streaming error event stops stream', function (): void {
     Http::fake([
         '*' => Http::response($this->ssePayload([
             ['error' => ['code' => 'server_error', 'message' => 'Internal error']],
@@ -84,16 +119,24 @@ test('streaming error event stops stream', function () {
     ]);
 
     $events = [];
-    foreach (agent()->stream('Hi', provider: 'openrouter') as $event) {
-        $events[] = $event;
+    $error = null;
+
+    try {
+        foreach (agent()->stream('Hi', provider: 'openrouter') as $event) {
+            $events[] = $event;
+        }
+    } catch (StreamErrorException $exception) {
+        $error = $exception->error;
     }
 
-    $errorEvents = array_values(array_filter($events, fn ($e) => $e instanceof Error));
+    $errorEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof Error));
+
     expect($errorEvents)->toHaveCount(1)
-        ->and($errorEvents[0]->type)->toBe('server_error');
+        ->and($errorEvents[0]->type)->toBe('server_error')
+        ->and($error)->toBe($errorEvents[0]);
 });
 
-test('streaming error finish reason emits error event', function () {
+test('streaming error finish reason emits error event', function (): void {
     Http::fake([
         '*' => Http::response($this->ssePayload([
             ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Partial'], 'finish_reason' => null]]],
@@ -102,16 +145,24 @@ test('streaming error finish reason emits error event', function () {
     ]);
 
     $events = [];
-    foreach (agent()->stream('Hi', provider: 'openrouter') as $event) {
-        $events[] = $event;
+    $error = null;
+
+    try {
+        foreach (agent()->stream('Hi', provider: 'openrouter') as $event) {
+            $events[] = $event;
+        }
+    } catch (StreamErrorException $exception) {
+        $error = $exception->error;
     }
 
-    $errorEvents = array_values(array_filter($events, fn ($e) => $e instanceof Error));
+    $errorEvents = array_values(array_filter($events, fn ($e): bool => $e instanceof Error));
+
     expect($errorEvents)->toHaveCount(1)
-        ->and($errorEvents[0]->type)->toBe('502');
+        ->and($errorEvents[0]->type)->toBe('502')
+        ->and($error)->toBe($errorEvents[0]);
 });
 
-test('streaming captures usage from final chunk', function () {
+test('streaming captures usage from final chunk', function (): void {
     Http::fake([
         '*' => Http::response($this->ssePayload([
             ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Hi'], 'finish_reason' => null]]],
@@ -125,13 +176,35 @@ test('streaming captures usage from final chunk', function () {
         $events[] = $event;
     }
 
-    $streamEnd = array_values(array_filter($events, fn ($e) => $e instanceof StreamEnd));
+    $streamEnd = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd));
     expect($streamEnd)->toHaveCount(1)
         ->and($streamEnd[0]->usage->promptTokens)->toBe(15)
         ->and($streamEnd[0]->usage->completionTokens)->toBe(3);
 });
 
-test('streaming finish reason maps correctly', function (string $apiReason, $expected) {
+test('streaming excludes cached tokens from the prompt token count', function (): void {
+    Http::fake([
+        '*' => Http::response($this->ssePayload([
+            ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Hi'], 'finish_reason' => null]]],
+            ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => [], 'finish_reason' => 'stop']]],
+            ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [], 'usage' => ['prompt_tokens' => 100, 'completion_tokens' => 5, 'prompt_tokens_details' => ['cached_tokens' => 20, 'cache_write_tokens' => 30]]],
+        ])),
+    ]);
+
+    $events = [];
+    foreach (agent()->stream('Hi', provider: 'openrouter') as $event) {
+        $events[] = $event;
+    }
+
+    $streamEnd = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd));
+    expect($streamEnd)->toHaveCount(1)
+        ->and($streamEnd[0]->usage->promptTokens)->toBe(50)
+        ->and($streamEnd[0]->usage->completionTokens)->toBe(5)
+        ->and($streamEnd[0]->usage->cacheReadInputTokens)->toBe(20)
+        ->and($streamEnd[0]->usage->cacheWriteInputTokens)->toBe(30);
+});
+
+test('streaming finish reason maps correctly', function (string $apiReason, $expected): void {
     Http::fake([
         '*' => Http::response($this->ssePayload([
             ['id' => 'chatcmpl-1', 'object' => 'chat.completion.chunk', 'model' => 'anthropic/claude-sonnet-4.6', 'choices' => [['index' => 0, 'delta' => ['role' => 'assistant', 'content' => 'Hello'], 'finish_reason' => null]]],
@@ -144,7 +217,7 @@ test('streaming finish reason maps correctly', function (string $apiReason, $exp
         $events[] = $event;
     }
 
-    $streamEnd = array_values(array_filter($events, fn ($e) => $e instanceof StreamEnd))[0];
+    $streamEnd = array_values(array_filter($events, fn ($e): bool => $e instanceof StreamEnd))[0];
 
     expect($streamEnd->reason)->toBe($expected->value);
 })->with([
@@ -154,3 +227,87 @@ test('streaming finish reason maps correctly', function (string $apiReason, $exp
     'content_filter maps to ContentFilter' => ['content_filter', FinishReason::ContentFilter],
     'unknown maps to Unknown' => ['unknown_reason', FinishReason::Unknown],
 ]);
+
+test('streaming emits citation events for web search annotations', function (): void {
+    Http::fake([
+        '*' => Http::response($this->ssePayload([
+            $this->chatChunk(['role' => 'assistant', 'content' => 'Paris is the capital']),
+            $this->chatChunk(['content' => ' of France.', 'annotations' => [
+                [
+                    'type' => 'url_citation',
+                    'url_citation' => [
+                        'url' => 'https://example.com/paris',
+                        'title' => 'Paris - Wikipedia',
+                        'start_index' => 0,
+                        'end_index' => 30,
+                    ],
+                ],
+            ]]),
+            $this->chatChunkFinish('stop', ['prompt_tokens' => 10, 'completion_tokens' => 5]),
+        ])),
+    ]);
+
+    $events = [];
+    foreach (agent()->stream('What is the capital of France?', provider: 'openrouter') as $event) {
+        $events[] = $event;
+    }
+
+    $citations = array_values(array_filter($events, fn ($e): bool => $e instanceof CitationEvent));
+
+    expect($citations)->toHaveCount(1)
+        ->and($citations[0]->citation->url)->toBe('https://example.com/paris')
+        ->and($citations[0]->citation->title)->toBe('Paris - Wikipedia')
+        ->and($citations[0]->citation->startIndex)->toBe(0)
+        ->and($citations[0]->citation->endIndex)->toBe(30);
+});
+
+test('streaming emits multiple citation events across chunks', function (): void {
+    Http::fake([
+        '*' => Http::response($this->ssePayload([
+            $this->chatChunk(['role' => 'assistant', 'content' => 'Answer', 'annotations' => [
+                [
+                    'type' => 'url_citation',
+                    'url_citation' => ['url' => 'https://example.com/one', 'title' => 'One'],
+                ],
+            ]]),
+            $this->chatChunk(['content' => ' more', 'annotations' => [
+                [
+                    'type' => 'url_citation',
+                    'url_citation' => ['url' => 'https://example.com/two', 'title' => 'Two'],
+                ],
+            ]]),
+            $this->chatChunkFinish('stop', ['prompt_tokens' => 5, 'completion_tokens' => 2]),
+        ])),
+    ]);
+
+    $events = [];
+    foreach (agent()->stream('Question', provider: 'openrouter') as $event) {
+        $events[] = $event;
+    }
+
+    $citations = array_values(array_filter($events, fn ($e): bool => $e instanceof CitationEvent));
+
+    expect($citations)->toHaveCount(2)
+        ->and($citations[0]->citation->url)->toBe('https://example.com/one')
+        ->and($citations[1]->citation->url)->toBe('https://example.com/two');
+});
+
+test('streaming ignores non-url-citation annotation types', function (): void {
+    Http::fake([
+        '*' => Http::response($this->ssePayload([
+            $this->chatChunk(['role' => 'assistant', 'content' => 'Answer', 'annotations' => [
+                ['type' => 'other_type', 'data' => 'something'],
+            ]]),
+            $this->chatChunkFinish('stop', ['prompt_tokens' => 5, 'completion_tokens' => 2]),
+        ])),
+    ]);
+
+    $events = [];
+    foreach (agent()->stream('Question', provider: 'openrouter') as $event) {
+        $events[] = $event;
+    }
+
+    $citations = array_values(array_filter($events, fn ($e): bool => $e instanceof CitationEvent));
+
+    expect($citations)->toHaveCount(0);
+});

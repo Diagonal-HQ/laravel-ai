@@ -1,6 +1,7 @@
 <?php
 
 use GuzzleHttp\Promise\PromiseInterface;
+use Illuminate\Http\Client\Request;
 use Illuminate\Support\Facades\Http;
 
 function requiresApiKey(string ...$keys): void
@@ -10,6 +11,30 @@ function requiresApiKey(string ...$keys): void
             test()->markTestSkipped("Missing {$key} — skipping external test.");
         }
     }
+}
+
+function sentRequest(): Request
+{
+    [$request] = Http::recorded()->first();
+
+    return $request;
+}
+
+function multipartField(Request $request, string $name): ?string
+{
+    return collect($request->data())->firstWhere('name', $name)['contents'] ?? null;
+}
+
+// Laravel 12 flattens nested multipart arrays to "name[]" => value while Laravel 13 keeps "name" => array, so we compare just the values to stay stable across both.
+function multipartNestedField(Request $request, string $name): array
+{
+    return collect($request->data())
+        ->reject(fn ($field): bool => isset($field['filename']))
+        ->filter(fn ($field): bool => (($field['name'] ?? null) === $name && is_array($field['contents'] ?? null))
+            || preg_match('/^'.preg_quote($name, '/').'\[[^\]]*\]$/', $field['name'] ?? '') === 1)
+        ->flatMap(fn ($field): array => is_array($field['contents'] ?? null) ? array_values($field['contents']) : [$field['contents'] ?? null])
+        ->values()
+        ->all();
 }
 
 function fakeGroqResponse(string $text = 'Hello'): PromiseInterface
@@ -29,6 +54,90 @@ function fakeGroqResponse(string $text = 'Hello'): PromiseInterface
         'usage' => [
             'prompt_tokens' => 1,
             'completion_tokens' => 1,
+        ],
+    ]);
+}
+
+function fakeGroqStreamResponse(string $text = 'Hello'): PromiseInterface
+{
+    $chunk = fn (array|object $delta, ?string $finishReason = null): array => [
+        'id' => 'chatcmpl-123',
+        'object' => 'chat.completion.chunk',
+        'model' => 'openai/gpt-oss-20b',
+        'choices' => [['index' => 0, 'delta' => $delta, 'finish_reason' => $finishReason]],
+    ];
+
+    $body = implode("\n\n", [
+        'data: '.json_encode($chunk(['role' => 'assistant', 'content' => $text])),
+        'data: '.json_encode($chunk((object) [], 'stop')),
+        'data: [DONE]',
+    ])."\n\n";
+
+    return Http::response($body, 200, ['Content-Type' => 'text/event-stream']);
+}
+
+function fakeGroqStreamErrorResponse(string $message = 'Upstream exploded.'): PromiseInterface
+{
+    $body = implode("\n\n", [
+        'data: '.json_encode(['error' => ['code' => 'server_error', 'message' => $message]]),
+        'data: [DONE]',
+    ])."\n\n";
+
+    return Http::response($body, 200, ['Content-Type' => 'text/event-stream']);
+}
+
+function fakeGroqStreamToolCallResponse(string $name = 'FixedNumberGenerator', string $id = 'call_123'): PromiseInterface
+{
+    $chunk = fn (array|object $delta, ?string $finishReason = null): array => [
+        'id' => 'chatcmpl-123',
+        'object' => 'chat.completion.chunk',
+        'model' => 'openai/gpt-oss-20b',
+        'choices' => [['index' => 0, 'delta' => $delta, 'finish_reason' => $finishReason]],
+    ];
+
+    $body = implode("\n\n", [
+        'data: '.json_encode($chunk(['role' => 'assistant', 'tool_calls' => [[
+            'index' => 0,
+            'id' => $id,
+            'type' => 'function',
+            'function' => ['name' => $name, 'arguments' => ''],
+        ]]])),
+        'data: '.json_encode($chunk(['tool_calls' => [[
+            'index' => 0,
+            'function' => ['arguments' => '{}'],
+        ]]])),
+        'data: '.json_encode($chunk((object) [], 'tool_calls')),
+        'data: [DONE]',
+    ])."\n\n";
+
+    return Http::response($body, 200, ['Content-Type' => 'text/event-stream']);
+}
+
+function fakeGroqToolCallResponse(string $name = 'FixedNumberGenerator', array $arguments = [], string $id = 'call_123'): PromiseInterface
+{
+    return Http::response([
+        'id' => 'chatcmpl-tool-123',
+        'object' => 'chat.completion',
+        'model' => 'openai/gpt-oss-20b',
+        'choices' => [[
+            'index' => 0,
+            'message' => [
+                'role' => 'assistant',
+                'content' => null,
+                'tool_calls' => [[
+                    'id' => $id,
+                    'type' => 'function',
+                    'function' => [
+                        'name' => $name,
+                        'arguments' => $arguments === [] ? '{}' : json_encode($arguments),
+                    ],
+                ]],
+            ],
+            'finish_reason' => 'tool_calls',
+        ]],
+        'usage' => [
+            'prompt_tokens' => 10,
+            'completion_tokens' => 5,
         ],
     ]);
 }

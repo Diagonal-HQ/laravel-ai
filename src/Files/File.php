@@ -2,14 +2,21 @@
 
 namespace Laravel\Ai\Files;
 
+use Closure;
 use InvalidArgumentException;
 use Laravel\Ai\Contracts\Files\HasName;
+use Laravel\Ai\Contracts\HasProviderOptions;
+use Laravel\Ai\Enums\Lab;
+use Laravel\SerializableClosure\SerializableClosure;
 
-abstract class File implements HasName
+abstract class File implements HasName, HasProviderOptions
 {
     public ?string $name = null;
 
     public ?string $mime = null;
+
+    /** @var array<string, mixed>|SerializableClosure */
+    protected array|SerializableClosure $providerOptions = [];
 
     /**
      * Reconstruct a file instance from its array representation.
@@ -33,10 +40,15 @@ abstract class File implements HasName
             'stored-document' => new StoredDocument(self::value($data, 'path', $type), $data['disk'] ?? null),
             'remote-document' => new RemoteDocument(self::value($data, 'url', $type), $data['mime'] ?? null),
             'provider-document' => new ProviderDocument(self::value($data, 'id', $type)),
+            's3-document' => new S3Document(self::value($data, 'url', $type), $data['bucket_owner'] ?? null, $data['mime'] ?? null),
             'base64-audio' => new Base64Audio(self::value($data, 'base64', $type), $data['mime'] ?? null),
             'local-audio' => new LocalAudio(self::value($data, 'path', $type), $data['mime'] ?? null),
             'stored-audio' => new StoredAudio(self::value($data, 'path', $type), $data['disk'] ?? null),
             'remote-audio' => new RemoteAudio(self::value($data, 'url', $type), $data['mime'] ?? null),
+            'base64-video' => new Base64Video(self::value($data, 'base64', $type), $data['mime'] ?? null),
+            'local-video' => new LocalVideo(self::value($data, 'path', $type), $data['mime'] ?? null),
+            'stored-video' => new StoredVideo(self::value($data, 'path', $type), $data['disk'] ?? null),
+            'remote-video' => new RemoteVideo(self::value($data, 'url', $type), $data['mime'] ?? null),
             default => null,
         };
 
@@ -72,6 +84,42 @@ abstract class File implements HasName
         $this->name = $name;
 
         return $this;
+    }
+
+    /**
+     * Specify provider-specific options for the file upload. Closures may only capture serializable values.
+     *
+     * @param  array<string, mixed>|Closure(Lab|string): ?array<string, mixed>  $options
+     */
+    public function withProviderOptions(array|Closure $options): static
+    {
+        $this->providerOptions = $options instanceof Closure
+            ? new SerializableClosure($options)
+            : $options;
+
+        return $this;
+    }
+
+    /**
+     * Get the provider-specific options for the file upload.
+     *
+     * @return array<string, mixed>
+     */
+    public function providerOptions(Lab|string $provider): array
+    {
+        if ($this->providerOptions instanceof SerializableClosure) {
+            return ($this->providerOptions)($provider) ?: [];
+        }
+
+        return $this->providerOptions;
+    }
+
+    /**
+     * Get the file's MIME type.
+     */
+    public function mimeType(): ?string
+    {
+        return $this->mime;
     }
 
     /**

@@ -2,135 +2,104 @@
 
 namespace Laravel\Ai\Gateway\Mistral;
 
-use Generator;
 use Illuminate\Contracts\Events\Dispatcher;
-use Laravel\Ai\Contracts\Files\HasName;
 use Laravel\Ai\Contracts\Files\TranscribableAudio;
+use Laravel\Ai\Contracts\Gateway\AudioGateway;
 use Laravel\Ai\Contracts\Gateway\EmbeddingGateway;
-use Laravel\Ai\Contracts\Gateway\TextGateway;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Gateway\TranscriptionGateway;
+use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
 use Laravel\Ai\Gateway\Concerns\HandlesFailoverErrors;
-use Laravel\Ai\Gateway\Concerns\InvokesTools;
 use Laravel\Ai\Gateway\Concerns\ParsesServerSentEvents;
+use Laravel\Ai\Gateway\Concerns\ResolvesAudioFilenames;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\MapsChatCompletionMessages;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\MapsChatCompletionTools;
+use Laravel\Ai\Gateway\OpenAiCompatible\Concerns\PerformsChatCompletionSteps;
+use Laravel\Ai\Gateway\StepContext;
 use Laravel\Ai\Gateway\TextGenerationOptions;
+use Laravel\Ai\Responses\AudioResponse;
 use Laravel\Ai\Responses\Data\Meta;
 use Laravel\Ai\Responses\Data\TranscriptionSegment;
 use Laravel\Ai\Responses\Data\Usage;
 use Laravel\Ai\Responses\EmbeddingsResponse;
-use Laravel\Ai\Responses\TextResponse;
 use Laravel\Ai\Responses\TranscriptionResponse;
+use RuntimeException;
 
-class MistralGateway implements EmbeddingGateway, TextGateway, TranscriptionGateway
+class MistralGateway implements AudioGateway, EmbeddingGateway, StepTextGateway, TranscriptionGateway
 {
     use Concerns\BuildsTextRequests;
     use Concerns\CreatesMistralClient;
     use Concerns\HandlesTextStreaming;
     use Concerns\MapsAttachments;
-    use Concerns\MapsMessages;
-    use Concerns\MapsTools;
     use Concerns\ParsesTextResponses;
     use HandlesFailoverErrors;
-    use InvokesTools;
+    use MapsChatCompletionMessages;
+    use MapsChatCompletionTools;
     use ParsesServerSentEvents;
+    use PerformsChatCompletionSteps;
+    use ResolvesAudioFilenames;
 
     public function __construct(protected Dispatcher $events)
     {
-        $this->initializeToolCallbacks();
+        //
+    }
+
+    /**
+     * Build the request body for the current text generation step.
+     */
+    protected function buildStepBody(
+        TextProvider $provider,
+        string $model,
+        ?string $instructions,
+        array $messages,
+        array $tools,
+        ?array $schema,
+        ?TextGenerationOptions $options,
+        StepContext $stepContext,
+    ): array {
+        return $this->buildTextRequestBody($provider, $model, $instructions, $messages, $tools, $schema, $options);
     }
 
     /**
      * {@inheritdoc}
      */
-    public function generateText(
-        TextProvider $provider,
+    public function generateAudio(
+        AudioProvider $provider,
         string $model,
-        ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
-    ): TextResponse {
-        $body = $this->buildTextRequestBody(
-            $provider,
-            $model,
-            $instructions,
-            $messages,
-            $tools,
-            $schema,
-            $options,
-        );
+        string $text,
+        string $voice,
+        ?string $instructions = null,
+        int $timeout = 30,
+    ): AudioResponse {
+        $voice = match ($voice) {
+            'default-male' => 'en_paul_neutral',
+            'default-female' => 'gb_jane_neutral',
+            default => $voice,
+        };
 
         $response = $this->withErrorHandling(
             $provider->name(),
-            fn () => $this->client($provider, $timeout)->post('chat/completions', $body),
+            fn () => $this->client($provider, $timeout)->post('audio/speech', [
+                'model' => $model,
+                'input' => $text,
+                'voice_id' => $voice,
+                'response_format' => 'mp3',
+            ]),
         );
 
-        $data = $response->json();
+        $encodedAudio = $response->json('audio_data');
 
-        $this->validateTextResponse($data);
+        if (! is_string($encodedAudio) || $encodedAudio === '') {
+            throw new RuntimeException('No audio data received from Mistral API.');
+        }
 
-        return $this->parseTextResponse(
-            $data,
-            $provider,
-            filled($schema),
-            $tools,
-            $schema,
-            $options,
-            $instructions,
-            $messages,
-            $timeout,
-        );
-    }
-
-    /**
-     * {@inheritdoc}
-     */
-    public function streamText(
-        string $invocationId,
-        TextProvider $provider,
-        string $model,
-        ?string $instructions,
-        array $messages = [],
-        array $tools = [],
-        ?array $schema = null,
-        ?TextGenerationOptions $options = null,
-        ?int $timeout = null,
-    ): Generator {
-        $body = $this->buildTextRequestBody(
-            $provider,
-            $model,
-            $instructions,
-            $messages,
-            $tools,
-            $schema,
-            $options,
-        );
-
-        $body['stream'] = true;
-        $body['stream_options'] = ['include_usage' => true];
-
-        $response = $this->withErrorHandling(
-            $provider->name(),
-            fn () => $this->client($provider, $timeout)
-                ->withOptions(['stream' => true])
-                ->post('chat/completions', $body),
-        );
-
-        yield from $this->processTextStream(
-            $invocationId,
-            $provider,
-            $model,
-            $tools,
-            $schema,
-            $options,
-            $response->getBody(),
-            $instructions,
-            $messages,
-            timeout: $timeout,
+        return new AudioResponse(
+            $encodedAudio,
+            new Meta($provider->name(), $model),
+            'audio/mpeg',
         );
     }
 
@@ -194,7 +163,7 @@ class MistralGateway implements EmbeddingGateway, TextGateway, TranscriptionGate
 
         return new TranscriptionResponse(
             $data['text'] ?? '',
-            collect($data['segments'] ?? [])->map(fn (array $segment) => new TranscriptionSegment(
+            collect($data['segments'] ?? [])->map(fn (array $segment): TranscriptionSegment => new TranscriptionSegment(
                 $segment['text'] ?? '',
                 $segment['speaker_id'] ?? '',
                 $segment['start'] ?? 0,
@@ -225,28 +194,5 @@ class MistralGateway implements EmbeddingGateway, TextGateway, TranscriptionGate
         }
 
         return $parts;
-    }
-
-    /**
-     * Determine the appropriate filename for the audio file based on its MIME type.
-     */
-    protected function audioFilename(TranscribableAudio $audio): string
-    {
-        if ($audio instanceof HasName && $audio->name()) {
-            return $audio->name();
-        }
-
-        $extension = match ($audio->mimeType()) {
-            'audio/webm' => 'webm',
-            'audio/ogg', 'audio/ogg; codecs=opus' => 'ogg',
-            'audio/wav', 'audio/x-wav' => 'wav',
-            'audio/mp4', 'audio/m4a', 'audio/x-m4a' => 'm4a',
-            'audio/flac', 'audio/x-flac' => 'flac',
-            'audio/mpeg', 'audio/mp3' => 'mp3',
-            'audio/mpga' => 'mpga',
-            default => 'mp3',
-        };
-
-        return "audio.{$extension}";
     }
 }

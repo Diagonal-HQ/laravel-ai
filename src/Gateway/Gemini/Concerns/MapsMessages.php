@@ -52,6 +52,15 @@ trait MapsMessages
      */
     protected function mapAssistantMessage(AssistantMessage|Message $message, array &$contents): void
     {
+        if ($message instanceof AssistantMessage && filled($message->providerContentBlocks)) {
+            $contents[] = [
+                'role' => 'model',
+                'parts' => $message->providerContentBlocks,
+            ];
+
+            return;
+        }
+
         $parts = [];
 
         if (filled($message->content)) {
@@ -95,17 +104,5 @@ trait MapsMessages
                 'parts' => $parts,
             ];
         }
-    }
-
-    /**
-     * Serialize a tool result output value to a string.
-     */
-    protected function serializeToolResultOutput(mixed $output): string
-    {
-        if (is_string($output)) {
-            return $output;
-        }
-
-        return is_array($output) ? json_encode($output) : strval($output);
     }
 }

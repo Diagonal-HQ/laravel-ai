@@ -6,16 +6,23 @@ use Illuminate\Contracts\Events\Dispatcher;
 use Laravel\Ai\Contracts\Gateway\AudioGateway;
 use Laravel\Ai\Contracts\Gateway\EmbeddingGateway;
 use Laravel\Ai\Contracts\Gateway\ImageGateway;
-use Laravel\Ai\Contracts\Gateway\TextGateway;
+use Laravel\Ai\Contracts\Gateway\RerankingGateway;
+use Laravel\Ai\Contracts\Gateway\StepTextGateway;
 use Laravel\Ai\Contracts\Gateway\TranscriptionGateway;
 use Laravel\Ai\Contracts\Providers\AudioProvider;
 use Laravel\Ai\Contracts\Providers\EmbeddingProvider;
 use Laravel\Ai\Contracts\Providers\ImageProvider;
+use Laravel\Ai\Contracts\Providers\RerankingProvider;
+use Laravel\Ai\Contracts\Providers\SupportsWebFetch;
+use Laravel\Ai\Contracts\Providers\SupportsWebSearch;
 use Laravel\Ai\Contracts\Providers\TextProvider;
 use Laravel\Ai\Contracts\Providers\TranscriptionProvider;
+use Laravel\Ai\Enums\Lab;
 use Laravel\Ai\Gateway\OpenRouter\OpenRouterGateway;
+use Laravel\Ai\Providers\Tools\WebFetch;
+use Laravel\Ai\Providers\Tools\WebSearch;
 
-class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingProvider, ImageProvider, TextProvider, TranscriptionProvider
+class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingProvider, ImageProvider, RerankingProvider, SupportsWebFetch, SupportsWebSearch, TextProvider, TranscriptionProvider
 {
     use Concerns\GeneratesAudio;
     use Concerns\GeneratesEmbeddings;
@@ -25,8 +32,10 @@ class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingPro
     use Concerns\HasAudioGateway;
     use Concerns\HasEmbeddingGateway;
     use Concerns\HasImageGateway;
+    use Concerns\HasRerankingGateway;
     use Concerns\HasTextGateway;
     use Concerns\HasTranscriptionGateway;
+    use Concerns\Reranks;
     use Concerns\StreamsText;
 
     public function __construct(protected array $config, protected Dispatcher $events)
@@ -35,9 +44,38 @@ class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingPro
     }
 
     /**
+     * Get the web fetch tool options for the provider.
+     */
+    public function webFetchToolOptions(WebFetch $fetch): array
+    {
+        return $this->serverToolOptions($fetch);
+    }
+
+    /**
+     * Get the web search tool options for the provider.
+     */
+    public function webSearchToolOptions(WebSearch $search): array
+    {
+        return $this->serverToolOptions($search);
+    }
+
+    /**
+     * Get the parameters for an OpenRouter server tool.
+     */
+    protected function serverToolOptions(WebFetch|WebSearch $tool): array
+    {
+        return array_filter([
+            'parameters' => array_filter([
+                'max_uses' => $tool->maxSearches,
+                'allowed_domains' => $tool->allowedDomains,
+            ]) + $tool->providerOptions(Lab::OpenRouter),
+        ]);
+    }
+
+    /**
      * Get the provider's text gateway.
      */
-    public function textGateway(): TextGateway
+    public function textGateway(): StepTextGateway
     {
         return $this->textGateway ??= new OpenRouterGateway($this->events);
     }
@@ -55,7 +93,7 @@ class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingPro
      */
     public function defaultTextModel(): string
     {
-        return $this->config['models']['text']['default'] ?? 'anthropic/claude-sonnet-4.6';
+        return $this->config['models']['text']['default'] ?? 'anthropic/claude-sonnet-5';
     }
 
     /**
@@ -71,7 +109,7 @@ class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingPro
      */
     public function smartestTextModel(): string
     {
-        return $this->config['models']['text']['smartest'] ?? 'anthropic/claude-opus-4.6';
+        return $this->config['models']['text']['smartest'] ?? 'anthropic/claude-opus-5';
     }
 
     /**
@@ -156,5 +194,21 @@ class OpenRouterProvider extends Provider implements AudioProvider, EmbeddingPro
     public function defaultEmbeddingsDimensions(): int
     {
         return $this->config['models']['embeddings']['dimensions'] ?? 1536;
+    }
+
+    /**
+     * Get the name of the default reranking model.
+     */
+    public function defaultRerankingModel(): string
+    {
+        return $this->config['models']['reranking']['default'] ?? 'cohere/rerank-v3.5';
+    }
+
+    /**
+     * Get the provider's reranking gateway.
+     */
+    public function rerankingGateway(): RerankingGateway
+    {
+        return $this->rerankingGateway ??= new OpenRouterGateway($this->events);
     }
 }
